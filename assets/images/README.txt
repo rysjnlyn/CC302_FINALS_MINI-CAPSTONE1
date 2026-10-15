@@ -1,0 +1,1 @@
+Place local image assets here if you add any. The supplied Vue project uses primarily CSS/Unicode icons rather than image assets.
