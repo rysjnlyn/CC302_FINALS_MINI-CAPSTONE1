@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:http/http.dart' as http;
 
 /// Small SharedPreferences-backed draft store. Each form uses a stable key,
 /// and writes are debounced so typing does not cause a preference write per key.
@@ -166,6 +167,56 @@ class Department {
       j['description'] ?? '',
       j['office'] ?? '',
       List<String>.from(j['requirements'] ?? []));
+}
+
+class LibraryBook {
+  final String title;
+  final List<String> authors;
+  final int? firstPublishYear;
+  final int? coverId;
+
+  const LibraryBook(
+      {required this.title,
+      required this.authors,
+      this.firstPublishYear,
+      this.coverId});
+
+  factory LibraryBook.fromJson(Map<String, dynamic> json) => LibraryBook(
+        title: json['title'] as String? ?? 'Untitled',
+        authors: (json['author_name'] as List<dynamic>? ?? [])
+            .whereType<String>()
+            .toList(),
+        firstPublishYear: json['first_publish_year'] as int?,
+        coverId: json['cover_i'] as int?,
+      );
+}
+
+/// Searches Open Library and returns book matches for the given title, author,
+/// or keyword. The request uses Open Library's documented Search API.
+Future<List<LibraryBook>> fetchLibraryBooks(String query) async {
+  final trimmedQuery = query.trim();
+  if (trimmedQuery.isEmpty) {
+    throw ArgumentError('Enter a book title, author, or keyword.');
+  }
+  final uri = Uri.https('openlibrary.org', '/search.json', {
+    'q': trimmedQuery,
+    'fields': 'key,title,author_name,first_publish_year,cover_i',
+    'limit': '20',
+  });
+  final response = await http.get(uri).timeout(const Duration(seconds: 15));
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    throw http.ClientException(
+        'Book search returned HTTP ${response.statusCode}', uri);
+  }
+  final decoded = jsonDecode(response.body);
+  if (decoded is! Map<String, dynamic> || decoded['docs'] is! List) {
+    throw const FormatException(
+        'The book API returned an unexpected response.');
+  }
+  return (decoded['docs'] as List)
+      .whereType<Map>()
+      .map((row) => LibraryBook.fromJson(Map<String, dynamic>.from(row)))
+      .toList();
 }
 
 class ClearanceRecord {
@@ -453,7 +504,7 @@ class ClearTrackState extends ChangeNotifier {
           'updatedAt': 'Oct 13, 2026'
         },
         {
-          'departmentId': 6,
+          'departmentId': 6,  
           'status': 'pending',
           'note': '',
           'updatedAt': 'Oct 13, 2026'
@@ -478,11 +529,14 @@ class ClearTrackState extends ChangeNotifier {
     if (notify) notifyListeners();
   }
 
-  void log(String action, String detail) {
+  void log(String action, String detail,
+      {int? departmentId, int? submissionId}) {
     activities.insert(0, {
       'action': action,
       'detail': detail,
-      'date': DateTime.now().toString().substring(0, 10)
+      'date': DateTime.now().toString().substring(0, 10),
+      if (departmentId != null) 'departmentId': departmentId.toString(),
+      if (submissionId != null) 'submissionId': submissionId.toString(),
     });
     if (activities.length > 100) activities.removeLast();
   }
@@ -553,18 +607,17 @@ class ClearTrackState extends ChangeNotifier {
     }
     String data = '';
     if (file?.bytes != null) data = base64Encode(file!.bytes!);
-    submissions.insert(
-        0,
-        Submission(
-            DateTime.now().millisecondsSinceEpoch,
-            departmentId,
-            details.trim(),
-            file?.name ?? '',
-            data,
-            'pending',
-            DateTime.now().toString().substring(0, 10),
-            studentName: user?.name ?? 'Alex Student',
-            studentId: user?.id ?? '2026001'));
+    final submission = Submission(
+        DateTime.now().millisecondsSinceEpoch,
+        departmentId,
+        details.trim(),
+        file?.name ?? '',
+        data,
+        'pending',
+        DateTime.now().toString().substring(0, 10),
+        studentName: user?.name ?? 'Alex Student',
+        studentId: user?.id ?? '2026001');
+    submissions.insert(0, submission);
     final r = record(departmentId);
     if (r != null) {
       r.status = 'pending';
@@ -572,7 +625,8 @@ class ClearTrackState extends ChangeNotifier {
       r.updatedAt = DateTime.now().toString().substring(0, 10);
     }
     log('Requirement submitted',
-        '${dept(departmentId)?.name ?? 'Department'} submitted for review');
+        '${dept(departmentId)?.name ?? 'Department'} submitted for review',
+        departmentId: departmentId, submissionId: submission.id);
     await _save();
   }
 
@@ -586,8 +640,27 @@ class ClearTrackState extends ChangeNotifier {
           : 'Please review the requirement and submit again';
       r.updatedAt = DateTime.now().toString().substring(0, 10);
     }
-    log(status == 'approved' ? 'Submission approved' : 'Submission returned',
-        '${dept(s.departmentId)?.name ?? 'Department'} · ${s.studentName}');
+    final outcome = status == 'approved' ? 'approved' : 'not approved';
+    log('Submission $outcome',
+        '${dept(s.departmentId)?.name ?? 'Department'} - ${s.studentName} - Status: ${status.toUpperCase()}',
+        departmentId: s.departmentId, submissionId: s.id);
+    await _save();
+  }
+
+  Future<void> editSubmission(
+      Submission submission, String details, PlatformFile? file) async {
+    submission.details = details.trim();
+    if (file != null) {
+      submission.fileName = file.name;
+      submission.fileData = file.bytes == null ? '' : base64Encode(file.bytes!);
+    }
+    submission.status = 'pending';
+    final r = record(submission.departmentId);
+    if (r != null) {
+      r.status = 'pending';
+      r.note = 'Updated submission for department review';
+      r.updatedAt = DateTime.now().toString().substring(0, 10);
+    }
     await _save();
   }
 
@@ -614,6 +687,33 @@ class ClearTrackState extends ChangeNotifier {
 
   Future<void> deleteSubmission(Submission s) async {
     submissions.removeWhere((x) => x.id == s.id);
+    await _save();
+  }
+
+  Future<void> removeSubmissionAttachment(Submission submission) async {
+    if (submission.details.trim().isEmpty) {
+      submissions.removeWhere((item) => item.id == submission.id);
+      final r = record(submission.departmentId);
+      if (r != null) {
+        r.status = 'needs-action';
+        r.note = 'Submission removed; please submit the requirement again';
+        r.updatedAt = DateTime.now().toString().substring(0, 10);
+      }
+      log('Submission removed',
+          '${dept(submission.departmentId)?.name ?? 'Department'} attachment removed');
+    } else {
+      submission.fileName = '';
+      submission.fileData = '';
+      submission.status = 'pending';
+      final r = record(submission.departmentId);
+      if (r != null) {
+        r.status = 'pending';
+        r.note = 'Attachment removed; note sent for department review';
+        r.updatedAt = DateTime.now().toString().substring(0, 10);
+      }
+      log('Submission attachment removed',
+          '${dept(submission.departmentId)?.name ?? 'Department'} note retained');
+    }
     await _save();
   }
 
@@ -706,6 +806,9 @@ class PortalShell extends StatefulWidget {
 
 class _PortalShellState extends State<PortalShell> {
   int index = 0;
+  int? _departmentFocusId;
+  int? _clearanceFocusId;
+  int? _submissionFocusId;
   String authPage = 'login';
   final GlobalKey<_DepartmentViewState> _departmentKey =
       GlobalKey<_DepartmentViewState>();
@@ -724,12 +827,20 @@ class _PortalShellState extends State<PortalShell> {
           'Requests',
           'Approved',
           'Returned',
+          'Library',
           'Departments',
           'Students',
           'Activity',
           'Profile'
         ]
-      : ['Dashboard', 'My clearance', 'Departments', 'Activity', 'Profile'];
+      : [
+          'Dashboard',
+          'My clearance',
+          'Library',
+          'Departments',
+          'Activity',
+          'Profile'
+        ];
 
   Future<void> _restoreLastPage() async {
     final user = widget.state.user;
@@ -757,11 +868,71 @@ class _PortalShellState extends State<PortalShell> {
   void _selectPage(String page, List<String> pages) {
     final nextIndex = pages.indexOf(page);
     if (nextIndex < 0) return;
-    setState(() => index = nextIndex);
+    setState(() {
+      index = nextIndex;
+      _departmentFocusId = null;
+      _clearanceFocusId = null;
+      _submissionFocusId = null;
+    });
     final user = widget.state.user;
     if (user != null) {
       unawaited(SharedPreferences.getInstance()
           .then((prefs) => prefs.setString('$_pageKeyPrefix${user.id}', page)));
+    }
+  }
+
+  void _openDepartment(Department department, List<String> pages) {
+    final nextIndex = pages.indexOf('Departments');
+    if (nextIndex < 0) return;
+    setState(() {
+      index = nextIndex;
+      _departmentFocusId = department.id;
+      _clearanceFocusId = null;
+      _submissionFocusId = null;
+    });
+    final user = widget.state.user;
+    if (user != null) {
+      unawaited(SharedPreferences.getInstance().then((prefs) =>
+          prefs.setString('$_pageKeyPrefix${user.id}', 'Departments')));
+    }
+  }
+
+  void _openClearanceDepartment(int departmentId, List<String> pages) {
+    final nextIndex = pages.indexOf('My clearance');
+    if (nextIndex < 0) return;
+    setState(() {
+      index = nextIndex;
+      _departmentFocusId = null;
+      _clearanceFocusId = departmentId;
+      _submissionFocusId = null;
+    });
+    final user = widget.state.user;
+    if (user != null) {
+      unawaited(SharedPreferences.getInstance().then((prefs) =>
+          prefs.setString('$_pageKeyPrefix${user.id}', 'My clearance')));
+    }
+  }
+
+  void _openActivityItem(Map<String, String> activity, List<String> pages) {
+    final departmentId = int.tryParse(activity['departmentId'] ?? '');
+    final submissionId = int.tryParse(activity['submissionId'] ?? '');
+    if (departmentId == null || submissionId == null) return;
+    if (widget.state.user?.role == 'admin') {
+      final nextIndex = pages.indexOf('Requests');
+      if (nextIndex < 0) return;
+      setState(() {
+        index = nextIndex;
+        _departmentFocusId = null;
+        _clearanceFocusId = null;
+        _submissionFocusId = submissionId;
+      });
+      final user = widget.state.user;
+      if (user != null) {
+        unawaited(SharedPreferences.getInstance().then((prefs) =>
+            prefs.setString('$_pageKeyPrefix${user.id}', 'Requests')));
+      }
+    } else {
+      _openClearanceDepartment(departmentId, pages);
     }
   }
 
@@ -839,9 +1010,25 @@ class _PortalShellState extends State<PortalShell> {
                             child: PageRouter(
                                 state: s,
                                 page: p,
+                                departmentFocusId: _departmentFocusId,
+                                clearanceFocusId: _clearanceFocusId,
+                                submissionFocusId: _submissionFocusId,
                                 departmentKey:
                                     p == 'Departments' ? _departmentKey : null,
-                                onNavigate: (p) => _selectPage(p, pages))))
+                                onNavigate: (p) => _selectPage(p, pages),
+                                onOpenActivity: (activity) =>
+                                    _openActivityItem(activity, pages),
+                                onOpenDepartment: (department) =>
+                                    _openDepartment(department, pages),
+                                onOpenClearanceDepartment: (departmentId) =>
+                                    _openClearanceDepartment(
+                                        departmentId, pages),
+                                onClearDepartmentFocus: () => setState(() {
+                                      _departmentFocusId = null;
+                                    }),
+                                onClearClearanceFocus: () => setState(() {
+                                      _clearanceFocusId = null;
+                                    }))))
                 ])),
               ]);
             }),
@@ -869,6 +1056,7 @@ class _PortalShellState extends State<PortalShell> {
         'Requests' => Icons.inbox_outlined,
         'Approved' => Icons.check_circle_outline,
         'Returned' => Icons.assignment_return_outlined,
+        'Library' => Icons.local_library_outlined,
         'Departments' => Icons.apartment_outlined,
         'Students' => Icons.people_outline,
         'Activity' => Icons.history,
@@ -881,33 +1069,62 @@ class PageRouter extends StatelessWidget {
   final ClearTrackState state;
   final String page;
   final ValueChanged<String> onNavigate;
+  final ValueChanged<Department> onOpenDepartment;
+  final ValueChanged<int> onOpenClearanceDepartment;
+  final int? departmentFocusId;
+  final int? clearanceFocusId;
+  final int? submissionFocusId;
+  final ValueChanged<Map<String, String>> onOpenActivity;
+  final VoidCallback onClearDepartmentFocus;
+  final VoidCallback onClearClearanceFocus;
   final Key? departmentKey;
   const PageRouter(
       {super.key,
       required this.state,
       required this.page,
       required this.onNavigate,
+      required this.onOpenDepartment,
+      required this.onOpenClearanceDepartment,
+      required this.departmentFocusId,
+      required this.clearanceFocusId,
+      required this.submissionFocusId,
+      required this.onOpenActivity,
+      required this.onClearDepartmentFocus,
+      required this.onClearClearanceFocus,
       this.departmentKey});
   @override
   Widget build(BuildContext context) =>
       Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         if (page == 'Dashboard')
-          DashboardView(state: state, onNavigate: onNavigate)
+          DashboardView(
+              state: state,
+              onNavigate: onNavigate,
+              onOpenDepartment: onOpenDepartment)
         else if (page == 'My clearance')
-          ClearanceView(state: state)
+          ClearanceView(
+              state: state,
+              focusDepartmentId: clearanceFocusId,
+              onOpenDepartment: onOpenClearanceDepartment,
+              onClearFocus: onClearClearanceFocus)
         else if (page == 'Departments')
           DepartmentView(
               key: departmentKey,
               state: state,
-              admin: state.user?.role == 'admin')
+              admin: state.user?.role == 'admin',
+              onOpenDepartment: onOpenDepartment,
+              focusDepartmentId: departmentFocusId,
+              onClearFocus: onClearDepartmentFocus)
+        else if (page == 'Library')
+          const LibraryView()
         else if (page == 'Activity')
-          ActivityView(state: state)
+          ActivityView(state: state, onOpenActivity: onOpenActivity)
         else if (page == 'Profile')
           ProfileView(state: state)
         else if (page == 'Overview')
           AdminDashboard(state: state, onNavigate: onNavigate)
         else if (page == 'Requests')
-          RequestView(state: state, status: 'all')
+          RequestView(
+              state: state, status: 'all', focusSubmissionId: submissionFocusId)
         else if (page == 'Approved')
           RequestView(state: state, status: 'approved')
         else if (page == 'Returned')
@@ -979,8 +1196,12 @@ Widget statusChip(String status) {
 class DashboardView extends StatelessWidget {
   final ClearTrackState state;
   final ValueChanged<String> onNavigate;
+  final ValueChanged<Department> onOpenDepartment;
   const DashboardView(
-      {super.key, required this.state, required this.onNavigate});
+      {super.key,
+      required this.state,
+      required this.onNavigate,
+      required this.onOpenDepartment});
   @override
   Widget build(BuildContext context) {
     final s = state;
@@ -1033,7 +1254,135 @@ class DashboardView extends StatelessWidget {
                   r.note.isEmpty ? 'Last updated: ${r.updatedAt}' : r.note),
               trailing: statusChip(r.status))
       ])),
+      const SizedBox(height: 18),
+      DepartmentSearch(state: s, onOpenDepartment: onOpenDepartment),
     ]);
+  }
+}
+
+class DepartmentSearch extends StatefulWidget {
+  final ClearTrackState state;
+  final ValueChanged<Department> onOpenDepartment;
+
+  const DepartmentSearch(
+      {super.key, required this.state, required this.onOpenDepartment});
+
+  @override
+  State<DepartmentSearch> createState() => _DepartmentSearchState();
+}
+
+class _DepartmentSearchState extends State<DepartmentSearch> {
+  String _query = '';
+
+  @override
+  Widget build(BuildContext context) {
+    final query = _query.trim().toLowerCase();
+    final departments = widget.state.departments.where((department) {
+      final searchable = [
+        department.name,
+        department.short,
+        department.office,
+        department.description,
+        ...department.requirements
+      ].join(' ').toLowerCase();
+      return searchable.contains(query);
+    }).toList();
+
+    return panel(Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text('Search departments',
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 4),
+        const Text(
+            'Search department records saved in this ClearTrack project.'),
+        const SizedBox(height: 12),
+        TextField(
+            decoration: const InputDecoration(
+                labelText: 'Department, office, or requirement',
+                prefixIcon: Icon(Icons.search)),
+            onChanged: (value) => setState(() {
+                  _query = value;
+                })),
+        const SizedBox(height: 8),
+        if (departments.isEmpty)
+          const Text('No departments match that search.'),
+        if (departments.isNotEmpty)
+          LayoutBuilder(builder: (context, constraints) {
+            final width = constraints.maxWidth;
+            final cardWidth = width >= 1000
+                ? (width - 24) / 3
+                : width >= 620
+                    ? (width - 12) / 2
+                    : width;
+            return Wrap(
+                spacing: 12,
+                runSpacing: 12,
+                children: departments
+                    .map((department) => SizedBox(
+                        width: cardWidth,
+                        child: Card(
+                            margin: EdgeInsets.zero,
+                            color: Colors.white,
+                            child: InkWell(
+                                onTap: () =>
+                                    widget.onOpenDepartment(department),
+                                borderRadius: BorderRadius.circular(14),
+                                child: Padding(
+                                    padding: const EdgeInsets.all(16),
+                                    child: Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          Row(
+                                              crossAxisAlignment:
+                                                  CrossAxisAlignment.start,
+                                              children: [
+                                                const Icon(Icons.apartment,
+                                                    color: green),
+                                                const SizedBox(width: 10),
+                                                Expanded(
+                                                    child: Text(department.name,
+                                                        style: const TextStyle(
+                                                            fontSize: 16,
+                                                            fontWeight:
+                                                                FontWeight
+                                                                    .bold))),
+                                                const Icon(Icons.arrow_forward,
+                                                    color: green, size: 20)
+                                              ]),
+                                          if (department.office.isNotEmpty) ...[
+                                            const SizedBox(height: 8),
+                                            Text(department.office,
+                                                style: const TextStyle(
+                                                    color: Colors.black54))
+                                          ],
+                                          if (department
+                                              .description.isNotEmpty) ...[
+                                            const SizedBox(height: 8),
+                                            Text(department.description)
+                                          ],
+                                          if (department
+                                              .requirements.isNotEmpty) ...[
+                                            const SizedBox(height: 10),
+                                            Wrap(
+                                                spacing: 6,
+                                                runSpacing: 6,
+                                                children: department
+                                                    .requirements
+                                                    .map((requirement) => Chip(
+                                                        label:
+                                                            Text(requirement),
+                                                        visualDensity:
+                                                            VisualDensity
+                                                                .compact))
+                                                    .toList())
+                                          ]
+                                        ]))))))
+                    .toList());
+          })
+      ],
+    ));
   }
 }
 
@@ -1056,7 +1405,15 @@ Widget stat(String label, String value, IconData icon, Color color) =>
 
 class ClearanceView extends StatefulWidget {
   final ClearTrackState state;
-  const ClearanceView({super.key, required this.state});
+  final int? focusDepartmentId;
+  final ValueChanged<int> onOpenDepartment;
+  final VoidCallback onClearFocus;
+  const ClearanceView(
+      {super.key,
+      required this.state,
+      required this.focusDepartmentId,
+      required this.onOpenDepartment,
+      required this.onClearFocus});
   @override
   State<ClearanceView> createState() => _ClearanceViewState();
 }
@@ -1104,6 +1461,12 @@ class _ClearanceViewState extends State<ClearanceView> {
       return (d?.name.toLowerCase().contains(search.toLowerCase()) ?? false) &&
           (filter == 'all' || r.status == filter);
     }).toList();
+    final focusedRecord = widget.focusDepartmentId == null
+        ? null
+        : s.record(widget.focusDepartmentId!);
+    if (focusedRecord != null) {
+      return _focusedClearanceView(s, focusedRecord);
+    }
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       heading('Student workspace', 'My clearance',
           'Follow each department review and attach required documents before submitting.'),
@@ -1148,54 +1511,135 @@ class _ClearanceViewState extends State<ClearanceView> {
               })),
       const SizedBox(height: 12),
       for (final r in rows)
+        panel(Material(
+            type: MaterialType.transparency,
+            child: InkWell(
+                borderRadius: BorderRadius.circular(16),
+                onTap: () => widget.onOpenDepartment(r.departmentId),
+                child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                    child: Row(children: [
+                      CircleAvatar(
+                          backgroundColor: const Color(0xFFE8F0E6),
+                          child: Text(s.dept(r.departmentId)?.icon ?? '✓',
+                              style: const TextStyle(color: green))),
+                      const SizedBox(width: 12),
+                      Expanded(
+                          child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                            Text(s.dept(r.departmentId)?.name ?? 'Department',
+                                style: const TextStyle(
+                                    fontWeight: FontWeight.bold, fontSize: 17)),
+                            Text(r.note.isEmpty
+                                ? 'Updated ${r.updatedAt}'
+                                : r.note)
+                          ])),
+                      const SizedBox(width: 8),
+                      statusChip(r.status),
+                      const Icon(Icons.chevron_right, color: green)
+                    ])))))
+    ]);
+  }
+
+  Widget _focusedClearanceView(ClearTrackState state, ClearanceRecord record) {
+    final department = state.dept(record.departmentId);
+    final submissions = state.submissions
+        .where((submission) =>
+            submission.departmentId == record.departmentId &&
+            submission.studentId == (state.user?.id ?? '2026001'))
+        .toList();
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      TextButton.icon(
+          onPressed: widget.onClearFocus,
+          icon: const Icon(Icons.arrow_back),
+          label: const Text('All clearance')),
+      heading('My clearance', department?.name ?? 'Department',
+          'Check this department’s status and manage your submission.'),
+      panel(Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          const Expanded(
+              child: Text('Current status',
+                  style: TextStyle(fontWeight: FontWeight.bold))),
+          statusChip(record.status)
+        ]),
+        const SizedBox(height: 8),
+        Text(record.note.isEmpty
+            ? 'Last updated: ${record.updatedAt}'
+            : record.note),
+        const SizedBox(height: 8),
+        const Text(
+            'For office details and the requirements checklist, open this department from the Departments section.')
+      ])),
+      for (final submission in submissions)
         panel(Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Row(children: [
-            CircleAvatar(
-                backgroundColor: const Color(0xFFE8F0E6),
-                child: Text(s.dept(r.departmentId)?.icon ?? '✓',
-                    style: const TextStyle(color: green))),
-            const SizedBox(width: 12),
-            Expanded(
-                child: Text(s.dept(r.departmentId)?.name ?? 'Department',
-                    style: const TextStyle(
-                        fontWeight: FontWeight.bold, fontSize: 17))),
-            statusChip(r.status)
-          ]),
-          const SizedBox(height: 8),
-          Text(s.dept(r.departmentId)?.description ?? ''),
-          const SizedBox(height: 8),
-          for (final req in s.dept(r.departmentId)?.requirements ?? [])
-            Padding(
-                padding: const EdgeInsets.only(bottom: 3),
-                child: Text('• $req',
-                    style: const TextStyle(color: Colors.black54))),
-          if (r.note.isNotEmpty)
-            Padding(
-                padding: const EdgeInsets.symmetric(vertical: 8),
-                child: Text('Office note: ${r.note}',
-                    style: const TextStyle(color: Colors.deepOrange))),
-          Align(
-              alignment: Alignment.centerRight,
-              child: OutlinedButton.icon(
-                  onPressed: () => _submit(context, r),
-                  icon: const Icon(Icons.attach_file),
-                  label: const Text('Submit / edit attachment')))
-        ]))
+          Text(
+              submission.fileName.isEmpty
+                  ? 'Submitted note'
+                  : submission.fileName,
+              style: const TextStyle(fontWeight: FontWeight.bold)),
+          if (submission.details.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text(submission.details)
+          ],
+          const SizedBox(height: 6),
+          Wrap(spacing: 4, children: [
+            if (submission.fileName.isNotEmpty)
+              TextButton.icon(
+                  onPressed: () => showSubmittedFile(context, submission),
+                  icon: const Icon(Icons.visibility_outlined),
+                  label: const Text('View file')),
+            TextButton.icon(
+                onPressed: () => showStudentSubmissionDialog(
+                    context, state, record,
+                    existing: submission),
+                icon: const Icon(Icons.edit_outlined),
+                label: const Text('Edit submission')),
+            if (submission.fileName.isNotEmpty)
+              TextButton.icon(
+                  onPressed: () => _removeFile(context, submission),
+                  icon: const Icon(Icons.delete_outline, color: Colors.red),
+                  label: const Text('Remove file',
+                      style: TextStyle(color: Colors.red)))
+          ])
+        ])),
+      Align(
+          alignment: Alignment.centerRight,
+          child: FilledButton.icon(
+              onPressed: () => _submit(context, record),
+              icon: const Icon(Icons.attach_file),
+              label: const Text('Submit requirements')))
     ]);
   }
 
   Future<void> _submit(BuildContext context, ClearanceRecord r) async {
     await showStudentSubmissionDialog(context, widget.state, r);
   }
+
+  Future<void> _removeFile(BuildContext context, Submission submission) async {
+    final onlyFile = submission.details.trim().isEmpty;
+    final message = onlyFile
+        ? 'This submission has no note. Removing its file will delete the submission and return the requirement for resubmission. Continue?'
+        : 'Remove ${submission.fileName}? The note will remain and be sent for department review.';
+    if (!await confirm(context, message)) return;
+    await widget.state.removeSubmissionAttachment(submission);
+    if (context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(onlyFile
+              ? 'Submission removed. You can submit the requirement again.'
+              : 'File removed. Your note was kept.')));
+    }
+  }
 }
 
 Future<void> showStudentSubmissionDialog(
-    BuildContext context, ClearTrackState state, ClearanceRecord r) async {
+    BuildContext context, ClearTrackState state, ClearanceRecord r,
+    {Submission? existing}) async {
   final draftId = 'submission:${state.user?.id ?? 'guest'}:${r.departmentId}';
   final saved = await FormDrafts.load(draftId);
   if (!context.mounted) return;
-  final details =
-      TextEditingController(text: saved['details'] as String? ?? '');
+  final details = TextEditingController(
+      text: saved['details'] as String? ?? existing?.details ?? '');
   details
       .addListener(() => FormDrafts.save(draftId, {'details': details.text}));
   PlatformFile? file;
@@ -1205,8 +1649,9 @@ Future<void> showStudentSubmissionDialog(
           controllers: [details],
           child: StatefulBuilder(
               builder: (ctx, setD) => AlertDialog(
-                      title:
-                          Text('Submit to ${state.dept(r.departmentId)?.name}'),
+                      title: Text(existing == null
+                          ? 'Submit to ${state.dept(r.departmentId)?.name}'
+                          : 'Edit submission'),
                       content: SingleChildScrollView(
                           child:
                               Column(mainAxisSize: MainAxisSize.min, children: [
@@ -1225,7 +1670,9 @@ Future<void> showStudentSubmissionDialog(
                               }
                             },
                             icon: const Icon(Icons.attach_file),
-                            label: Text(file?.name ?? 'Attach PDF or file'))
+                            label: Text(file?.name ??
+                                existing?.fileName ??
+                                'Attach PDF or file'))
                       ])),
                       actions: [
                         TextButton(
@@ -1234,15 +1681,22 @@ Future<void> showStudentSubmissionDialog(
                         FilledButton(
                             onPressed: () async {
                               try {
-                                await state.submit(
-                                    r.departmentId, details.text, file);
+                                if (existing == null) {
+                                  await state.submit(
+                                      r.departmentId, details.text, file);
+                                } else {
+                                  await state.editSubmission(
+                                      existing, details.text, file);
+                                }
                                 details.clear();
                                 await FormDrafts.clear(draftId);
                                 if (ctx.mounted) Navigator.pop(ctx);
                                 if (context.mounted) {
                                   ScaffoldMessenger.of(context).showSnackBar(
-                                      const SnackBar(
-                                          content: Text('Submission saved.')));
+                                      SnackBar(
+                                          content: Text(existing == null
+                                              ? 'Submission saved.'
+                                              : 'Submission updated.')));
                                 }
                               } catch (e) {
                                 if (context.mounted) {
@@ -1255,14 +1709,232 @@ Future<void> showStudentSubmissionDialog(
                                 }
                               }
                             },
-                            child: const Text('Submit'))
+                            child: Text(
+                                existing == null ? 'Submit' : 'Save changes'))
                       ]))));
+}
+
+Future<void> showSubmittedFile(
+    BuildContext context, Submission submission) async {
+  if (submission.fileData.isEmpty) {
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('This submission has no readable file data.')));
+    return;
+  }
+  final bytes = base64Decode(submission.fileData);
+  final name = submission.fileName.toLowerCase();
+  final Widget preview;
+  if (name.endsWith('.png') ||
+      name.endsWith('.jpg') ||
+      name.endsWith('.jpeg') ||
+      name.endsWith('.gif') ||
+      name.endsWith('.webp')) {
+    preview = InteractiveViewer(child: Image.memory(bytes));
+  } else if (name.endsWith('.txt') ||
+      name.endsWith('.csv') ||
+      name.endsWith('.md') ||
+      name.endsWith('.json')) {
+    preview = SingleChildScrollView(
+        child: SelectableText(utf8.decode(bytes, allowMalformed: true)));
+  } else {
+    preview = Text('Preview is not available for ${submission.fileName}.');
+  }
+  await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+            title: Text(submission.fileName),
+            content: SizedBox(width: 560, height: 420, child: preview),
+            actions: [
+              TextButton(
+                  onPressed: () => Navigator.pop(ctx),
+                  child: const Text('Close'))
+            ],
+          ));
+}
+
+class LibraryView extends StatefulWidget {
+  const LibraryView({super.key});
+
+  @override
+  State<LibraryView> createState() => _LibraryViewState();
+}
+
+class _LibraryViewState extends State<LibraryView> {
+  final TextEditingController _searchController = TextEditingController();
+  List<LibraryBook> _books = [];
+  bool _loading = false;
+  String? _error;
+  bool _searched = false;
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _searchBooks() async {
+    FocusScope.of(context).unfocus();
+    setState(() {
+      _loading = true;
+      _error = null;
+      _searched = true;
+    });
+    try {
+      final books = await fetchLibraryBooks(_searchController.text);
+      if (!mounted) return;
+      setState(() => _books = books);
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _books = [];
+        _error = error.toString().replaceFirst('Exception: ', '');
+      });
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          heading('Book discovery', 'Library search',
+              'Search a public catalog for books by title, author, or keyword.'),
+          panel(Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('Search books',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 4),
+            const Text('Results are provided by the Open Library Search API.'),
+            const SizedBox(height: 12),
+            LayoutBuilder(builder: (context, constraints) {
+              final field = TextField(
+                controller: _searchController,
+                textInputAction: TextInputAction.search,
+                onSubmitted: (_) => _searchBooks(),
+                decoration: const InputDecoration(
+                    labelText: 'Book title, author, or keyword',
+                    hintText: 'e.g. Philippine history',
+                    prefixIcon: Icon(Icons.search)),
+              );
+              final button = FilledButton.icon(
+                  onPressed: _loading ? null : _searchBooks,
+                  icon: _loading
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Icon(Icons.search),
+                  label: Text(_loading ? 'Searching…' : 'Search books'));
+              if (constraints.maxWidth < 540) {
+                return Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [field, const SizedBox(height: 8), button]);
+              }
+              return Row(children: [
+                Expanded(child: field),
+                const SizedBox(width: 10),
+                button
+              ]);
+            }),
+            if (_error != null) ...[
+              const SizedBox(height: 12),
+              Text(_error!, style: const TextStyle(color: Colors.red))
+            ]
+          ])),
+          const SizedBox(height: 16),
+          if (!_searched)
+            panel(const Text('Enter a search term to find books.'))
+          else if (!_loading && _error == null && _books.isEmpty)
+            panel(const Text('No books found. Try another title or author.'))
+          else if (_books.isNotEmpty) ...[
+            Text('${_books.length} book results',
+                style:
+                    const TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 10),
+            LayoutBuilder(builder: (context, constraints) {
+              final width = constraints.maxWidth;
+              final cardWidth = width >= 1000
+                  ? (width - 24) / 3
+                  : width >= 620
+                      ? (width - 12) / 2
+                      : width;
+              return Wrap(
+                  spacing: 12,
+                  runSpacing: 12,
+                  children: _books
+                      .map((book) =>
+                          SizedBox(width: cardWidth, child: _bookCard(book)))
+                      .toList());
+            })
+          ]
+        ],
+      );
+
+  Widget _bookCard(LibraryBook book) => Card(
+        margin: EdgeInsets.zero,
+        color: Colors.white,
+        child: Padding(
+          padding: const EdgeInsets.all(14),
+          child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            ClipRRect(
+                borderRadius: BorderRadius.circular(6),
+                child: SizedBox(
+                    width: 64,
+                    height: 92,
+                    child: book.coverId == null
+                        ? Container(
+                            color: const Color(0xFFE8F0E6),
+                            child: const Icon(Icons.menu_book,
+                                color: green, size: 34))
+                        : Image.network(
+                            'https://covers.openlibrary.org/b/id/${book.coverId}-M.jpg',
+                            fit: BoxFit.cover,
+                            errorBuilder: (_, __, ___) => Container(
+                                color: const Color(0xFFE8F0E6),
+                                child: const Icon(Icons.menu_book,
+                                    color: green, size: 34)),
+                          ))),
+            const SizedBox(width: 12),
+            Expanded(
+                child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                  Text(book.title,
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 6),
+                  Text(
+                      book.authors.isEmpty
+                          ? 'Author not listed'
+                          : book.authors.join(', '),
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis),
+                  if (book.firstPublishYear != null) ...[
+                    const SizedBox(height: 4),
+                    Text('First published ${book.firstPublishYear}',
+                        style: const TextStyle(
+                            color: Colors.black54, fontSize: 12))
+                  ]
+                ]))
+          ]),
+        ),
+      );
 }
 
 class DepartmentView extends StatefulWidget {
   final ClearTrackState state;
   final bool admin;
-  const DepartmentView({super.key, required this.state, required this.admin});
+  final ValueChanged<Department> onOpenDepartment;
+  final int? focusDepartmentId;
+  final VoidCallback onClearFocus;
+  const DepartmentView(
+      {super.key,
+      required this.state,
+      required this.admin,
+      required this.onOpenDepartment,
+      required this.focusDepartmentId,
+      required this.onClearFocus});
   @override
   State<DepartmentView> createState() => _DepartmentViewState();
 }
@@ -1297,89 +1969,97 @@ class _DepartmentViewState extends State<DepartmentView> {
             .toLowerCase()
             .contains(search.toLowerCase()))
         .toList();
+    final focused = widget.focusDepartmentId == null
+        ? null
+        : s.dept(widget.focusDepartmentId!);
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      heading(
-          widget.admin ? 'Directory management' : 'Campus directory',
-          widget.admin ? 'Manage departments' : 'Departments',
-          widget.admin
-              ? 'Create, update, and remove clearance offices.'
-              : 'Know where to go and what to prepare before requesting clearance.'),
-      TextField(
-          controller: _searchDraft.controller,
-          decoration: const InputDecoration(
-              prefixIcon: Icon(Icons.search), hintText: 'Search departments…'),
-          onChanged: (_) => setState(() {})),
-      const SizedBox(height: 14),
-      if (widget.admin)
-        Align(
-            alignment: Alignment.centerRight,
-            child: primaryButton('＋ Add department', () => _edit(context),
-                key: const ValueKey('add-department'))),
-      for (final d in ds)
-        widget.admin ? _departmentAdminCard(d, s) : _departmentStudentCard(d),
+      if (focused != null && !widget.admin) ...[
+        TextButton.icon(
+            onPressed: widget.onClearFocus,
+            icon: const Icon(Icons.arrow_back),
+            label: const Text('All departments')),
+        heading('Campus directory', focused.name,
+            'Department details and clearance requirements.'),
+        _focusedDepartmentCard(focused)
+      ] else ...[
+        heading(
+            widget.admin ? 'Directory management' : 'Campus directory',
+            widget.admin ? 'Manage departments' : 'Departments',
+            widget.admin
+                ? 'Create, update, and remove clearance offices.'
+                : 'Know where to go and what to prepare before requesting clearance.'),
+        TextField(
+            controller: _searchDraft.controller,
+            decoration: const InputDecoration(
+                prefixIcon: Icon(Icons.search),
+                hintText: 'Search departments…'),
+            onChanged: (_) => setState(() {})),
+        const SizedBox(height: 14),
+        if (widget.admin)
+          Align(
+              alignment: Alignment.centerRight,
+              child: primaryButton('＋ Add department', () => _edit(context),
+                  key: const ValueKey('add-department'))),
+        for (final d in ds)
+          widget.admin ? _departmentAdminCard(d, s) : _departmentStudentCard(d),
+      ],
     ]);
   }
 
-  Widget _departmentStudentCard(Department d) => panel(Material(
-        type: MaterialType.transparency,
-        child: ExpansionTile(
-          key: PageStorageKey('student-department-${d.id}'),
-          tilePadding: EdgeInsets.zero,
-          childrenPadding: const EdgeInsets.only(bottom: 8),
-          leading: CircleAvatar(
-              backgroundColor: const Color(0xFFE8F0E6),
-              child: Text(d.icon, style: const TextStyle(color: green))),
-          title: Text(d.name,
-              style:
-                  const TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
-          subtitle: Text('${d.short} · ${d.description}'),
-          children: [
-            Align(
-                alignment: Alignment.centerLeft,
-                child: Text(d.description,
-                    style: const TextStyle(color: Colors.black87))),
-            const SizedBox(height: 12),
-            const Align(
-                alignment: Alignment.centerLeft,
-                child: Text('What to prepare',
-                    style: TextStyle(fontWeight: FontWeight.bold))),
-            for (final requirement in d.requirements)
-              Align(
-                  alignment: Alignment.centerLeft,
-                  child: Padding(
-                      padding: const EdgeInsets.only(top: 5),
-                      child: Row(children: [
-                        const Icon(Icons.checklist, size: 18, color: green),
-                        const SizedBox(width: 8),
-                        Expanded(child: Text(requirement))
-                      ]))),
-            const SizedBox(height: 10),
-            Align(
-                alignment: Alignment.centerLeft,
-                child: Text('Contact: ${d.office}',
-                    style: const TextStyle(color: Colors.black54))),
-            const SizedBox(height: 8),
-            Align(
-                alignment: Alignment.centerRight,
-                child: FilledButton.icon(
-                    key: ValueKey('department-clearance-${d.id}'),
-                    onPressed: () {
-                      final record = widget.state.record(d.id);
-                      if (record == null) {
-                        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-                            content: Text(
-                                'No clearance record for this department.')));
-                        return;
-                      }
-                      showStudentSubmissionDialog(
-                          context, widget.state, record);
-                    },
-                    icon: const Icon(Icons.attach_file),
-                    label: const Text('Submit / edit attachment')))
-          ],
-        ),
-      ));
+  Widget _focusedDepartmentCard(Department department) {
+    return panel(
+        Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Row(children: [
+        CircleAvatar(
+            backgroundColor: const Color(0xFFE8F0E6),
+            child: Text(department.icon, style: const TextStyle(color: green))),
+        const SizedBox(width: 12),
+        Text(department.short,
+            style: const TextStyle(color: green, fontWeight: FontWeight.bold))
+      ]),
+      const SizedBox(height: 12),
+      Text(department.description),
+      const SizedBox(height: 16),
+      const Text('What to prepare',
+          style: TextStyle(fontWeight: FontWeight.bold)),
+      for (final requirement in department.requirements)
+        Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Icon(Icons.checklist, size: 18, color: green),
+              const SizedBox(width: 8),
+              Expanded(child: Text(requirement))
+            ])),
+      const SizedBox(height: 16),
+      Text('Contact: ${department.office}',
+          style: const TextStyle(color: Colors.black54)),
+    ]));
+  }
 
+  Widget _departmentStudentCard(Department department) => panel(Material(
+      type: MaterialType.transparency,
+      child: InkWell(
+          borderRadius: BorderRadius.circular(16),
+          onTap: () => widget.onOpenDepartment(department),
+          child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              child: Row(children: [
+                CircleAvatar(
+                    backgroundColor: const Color(0xFFE8F0E6),
+                    child: Text(department.icon,
+                        style: const TextStyle(color: green))),
+                const SizedBox(width: 12),
+                Expanded(
+                    child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                      Text(department.name,
+                          style: const TextStyle(
+                              fontWeight: FontWeight.bold, fontSize: 18)),
+                      Text('${department.short} · ${department.office}')
+                    ])),
+                const Icon(Icons.chevron_right, color: green)
+              ])))));
   Widget _departmentAdminCard(Department d, ClearTrackState s) =>
       panel(Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Row(children: [
@@ -1525,7 +2205,9 @@ Future<bool> confirm(BuildContext context, String text) async =>
 
 class ActivityView extends StatelessWidget {
   final ClearTrackState state;
-  const ActivityView({super.key, required this.state});
+  final ValueChanged<Map<String, String>> onOpenActivity;
+  const ActivityView(
+      {super.key, required this.state, required this.onOpenActivity});
   @override
   Widget build(BuildContext context) =>
       Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -1539,8 +2221,15 @@ class ActivityView extends StatelessWidget {
                   child: Icon(Icons.check, color: green)),
               title: Text(a['action'] ?? ''),
               subtitle: Text(a['detail'] ?? ''),
-              trailing:
-                  Text(a['date'] ?? '', style: const TextStyle(fontSize: 11))))
+              trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                Text(a['date'] ?? '', style: const TextStyle(fontSize: 11)),
+                if (a['submissionId'] != null)
+                  const Padding(
+                      padding: EdgeInsets.only(left: 8),
+                      child: Icon(Icons.chevron_right))
+              ]),
+              onTap:
+                  a['submissionId'] == null ? null : () => onOpenActivity(a)))
       ]);
 }
 
@@ -1725,7 +2414,12 @@ class AdminDashboard extends StatelessWidget {
 class RequestView extends StatefulWidget {
   final ClearTrackState state;
   final String status;
-  const RequestView({super.key, required this.state, required this.status});
+  final int? focusSubmissionId;
+  const RequestView(
+      {super.key,
+      required this.state,
+      required this.status,
+      this.focusSubmissionId});
   @override
   State<RequestView> createState() => _RequestViewState();
 }
@@ -1755,6 +2449,8 @@ class _RequestViewState extends State<RequestView> {
     final search = _searchDraft.controller.text;
     final items = s.submissions
         .where((x) =>
+            (widget.focusSubmissionId == null ||
+                x.id == widget.focusSubmissionId) &&
             (widget.status == 'all' || x.status == widget.status) &&
             ('${s.dept(x.departmentId)?.name} ${x.details} ${x.fileName} ${x.studentName}')
                 .toLowerCase()
@@ -1802,10 +2498,14 @@ class _RequestViewState extends State<RequestView> {
                   Expanded(
                       child:
                           Text(sub.fileName, overflow: TextOverflow.ellipsis)),
+                  IconButton(
+                      tooltip: 'View submitted file',
+                      onPressed: () => showSubmittedFile(context, sub),
+                      icon: const Icon(Icons.visibility_outlined)),
                   Text('${(sub.fileData.length / 1024).round()} KB',
                       style: const TextStyle(color: Colors.black54))
                 ])),
-          if (widget.status == 'all')
+          if (widget.status == 'all' && sub.status == 'pending')
             Wrap(spacing: 8, children: [
               FilledButton(
                   onPressed: () => s.review(sub, 'approved'),
